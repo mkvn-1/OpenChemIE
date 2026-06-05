@@ -14,6 +14,7 @@ import torch
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import JSONResponse, Response
 from huggingface_hub import hf_hub_download
+from PIL import ImageDraw
 from starlette.concurrency import run_in_threadpool
 
 from openchemie import OpenChemIE
@@ -226,6 +227,18 @@ def _jsonable(value: Any) -> Any:
     return value
 
 
+def _without_internal_files(payload: Any) -> Any:
+    if isinstance(payload, dict):
+        return {
+            key: _without_internal_files(value)
+            for key, value in payload.items()
+            if key != "_overlay_files"
+        }
+    if isinstance(payload, list):
+        return [_without_internal_files(item) for item in payload]
+    return payload
+
+
 def _summarize(results: list[dict[str, Any]]) -> dict[str, Any]:
     reaction_counts = [len(item.get("reactions", [])) for item in results]
     pages = sorted({item.get("page") for item in results if item.get("page") is not None})
@@ -406,6 +419,66 @@ def _split_large_figure(image: Any) -> list[dict[str, Any]]:
     return candidates
 
 
+def _draw_bbox(draw: ImageDraw.ImageDraw, bbox: Any, size: tuple[int, int], color: str) -> None:
+    bbox = _bbox_to_list(bbox)
+    if bbox is None:
+        return
+    width, height = size
+    x1, y1, x2, y2 = bbox
+    if max(abs(x1), abs(y1), abs(x2), abs(y2)) <= 1.5:
+        box = [x1 * width, y1 * height, x2 * width, y2 * height]
+    else:
+        box = [x1, y1, x2, y2]
+    draw.rectangle(box, outline=color, width=3)
+
+
+def _build_reaction_overlays(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    overlays: list[dict[str, Any]] = []
+    colors = {
+        "reactants": "red",
+        "products": "blue",
+        "conditions": "orange",
+    }
+    for output_index, result in enumerate(results, start=1):
+        image = result.get("figure")
+        if image is None:
+            continue
+        image = image.copy().convert("RGB")
+        draw = ImageDraw.Draw(image)
+        reaction_count = len(result.get("reactions", []))
+        title = (
+            f"out {output_index} page {result.get('page', -1) + 1} "
+            f"src {result.get('source_figure_index', output_index)} "
+            f"rxns {reaction_count}"
+        )
+        if result.get("source_panel"):
+            title += f" panel {result['source_panel']}"
+        draw.rectangle([0, 0, min(image.size[0], 720), 26], fill="white")
+        draw.text((6, 5), title, fill="black")
+        for reaction_index, reaction in enumerate(result.get("reactions", []), start=1):
+            draw.text((8, 26 + (reaction_index - 1) * 18), f"R{reaction_index}", fill="black")
+            for role, color in colors.items():
+                for item in reaction.get(role, []):
+                    _draw_bbox(draw, item.get("bbox"), image.size, color)
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+        overlays.append(
+            {
+                "name": (
+                    f"overlay_{output_index:02d}_page_{result.get('page', -1) + 1:02d}_"
+                    f"src_{result.get('source_figure_index', output_index):02d}"
+                    f"{'_' + result['source_panel'] if result.get('source_panel') else ''}.png"
+                ),
+                "content": buffer.getvalue(),
+                "page": result.get("page"),
+                "source_figure_index": result.get("source_figure_index"),
+                "source_panel": result.get("source_panel"),
+                "reaction_count": reaction_count,
+            }
+        )
+    return overlays
+
+
 def _extract_from_pdf_with_panel_fallback(
     model: OpenChemIE,
     pdf_path: str,
@@ -416,6 +489,7 @@ def _extract_from_pdf_with_panel_fallback(
     ocr: bool,
     split_large_figures: bool,
     deduplicate_figures: bool,
+    include_overlays: bool,
     min_panel_split_width: int,
     min_panel_split_height: int,
     panel_split_trigger_reactions: int,
@@ -527,6 +601,7 @@ def _extract_from_pdf_with_panel_fallback(
     metadata = {
         "split_large_figures": split_large_figures,
         "deduplicate_figures": deduplicate_figures,
+        "include_overlays": include_overlays,
         "min_panel_split_width": min_panel_split_width,
         "min_panel_split_height": min_panel_split_height,
         "panel_split_trigger_reactions": panel_split_trigger_reactions,
@@ -546,6 +621,7 @@ def _extract_from_pdf(
     ocr: bool,
     split_large_figures: bool,
     deduplicate_figures: bool,
+    include_overlays: bool,
     min_panel_split_width: int,
     min_panel_split_height: int,
     panel_split_trigger_reactions: int,
@@ -561,12 +637,14 @@ def _extract_from_pdf(
         ocr=ocr,
         split_large_figures=split_large_figures,
         deduplicate_figures=deduplicate_figures,
+        include_overlays=include_overlays,
         min_panel_split_width=min_panel_split_width,
         min_panel_split_height=min_panel_split_height,
         panel_split_trigger_reactions=panel_split_trigger_reactions,
     )
+    overlays = _build_reaction_overlays(results) if include_overlays else []
     clean_results = _jsonable(results)
-    return {
+    payload = {
         "metadata": {
             "method": "OpenChemIE.extract_reactions_from_figures_in_pdf",
             "batch_size": batch_size,
@@ -580,6 +658,12 @@ def _extract_from_pdf(
         },
         "results": clean_results,
     }
+    if overlays:
+        payload["_overlay_files"] = overlays
+        payload["metadata"]["overlay_count"] = len(overlays)
+    else:
+        payload["metadata"]["overlay_count"] = 0
+    return payload
 
 
 def _extract_text_reactions(pdf_path: str, *, num_pages: int | None) -> dict[str, Any]:
@@ -645,6 +729,7 @@ def _extract_combined_pdf(
     ocr: bool,
     split_large_figures: bool,
     deduplicate_figures: bool,
+    include_figure_overlays: bool,
     min_panel_split_width: int,
     min_panel_split_height: int,
     panel_split_trigger_reactions: int,
@@ -670,6 +755,7 @@ def _extract_combined_pdf(
             ocr=ocr,
             split_large_figures=split_large_figures,
             deduplicate_figures=deduplicate_figures,
+            include_overlays=include_figure_overlays,
             min_panel_split_width=min_panel_split_width,
             min_panel_split_height=min_panel_split_height,
             panel_split_trigger_reactions=panel_split_trigger_reactions,
@@ -746,6 +832,7 @@ async def extract_figures(
     ocr: bool = Query(False, description="OCR reaction condition text. Slower and uses more VRAM."),
     split_large_figures: bool = Query(True, description="Rerun large low-recall figures as smaller panels."),
     deduplicate_figures: bool = Query(True, description="Drop zero-reaction and overlapping duplicate figure crops."),
+    include_overlays: bool = Query(False, description="Include detection overlay PNGs in ZIP responses for manual audit."),
     min_panel_split_width: int = Query(900, ge=1),
     min_panel_split_height: int = Query(900, ge=1),
     panel_split_trigger_reactions: int = Query(0, ge=0, description="Split only when a large figure has this many reactions or fewer."),
@@ -768,6 +855,7 @@ async def extract_figures(
             ocr=ocr,
             split_large_figures=split_large_figures,
             deduplicate_figures=deduplicate_figures,
+            include_overlays=include_overlays,
             min_panel_split_width=min_panel_split_width,
             min_panel_split_height=min_panel_split_height,
             panel_split_trigger_reactions=panel_split_trigger_reactions,
@@ -778,14 +866,17 @@ async def extract_figures(
     if response_format == "zip":
         buffer = io.BytesIO()
         with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-            archive.writestr("result.json", json.dumps(payload, indent=2, ensure_ascii=False))
+            overlay_files = payload.get("_overlay_files", [])
+            archive.writestr("result.json", json.dumps(_without_internal_files(payload), indent=2, ensure_ascii=False))
+            for overlay in overlay_files:
+                archive.writestr(f"overlays/{overlay['name']}", overlay["content"])
         return Response(
             content=buffer.getvalue(),
             media_type="application/zip",
             headers={"Content-Disposition": "attachment; filename=openchemie_figure_results.zip"},
         )
 
-    return JSONResponse(payload)
+    return JSONResponse(_without_internal_files(payload))
 
 
 @app.post("/extract-pdf")
@@ -802,6 +893,7 @@ async def extract_pdf(
     ocr: bool = Query(False, description="OCR figure reaction condition text. Slower and uses more VRAM."),
     split_large_figures: bool = Query(True, description="Rerun large low-recall figures as smaller panels."),
     deduplicate_figures: bool = Query(True, description="Drop zero-reaction and overlapping duplicate figure crops."),
+    include_figure_overlays: bool = Query(False, description="Include figure detection overlay PNGs in ZIP responses for manual audit."),
     min_panel_split_width: int = Query(900, ge=1),
     min_panel_split_height: int = Query(900, ge=1),
     panel_split_trigger_reactions: int = Query(0, ge=0, description="Split only when a large figure has this many reactions or fewer."),
@@ -830,6 +922,7 @@ async def extract_pdf(
             ocr=ocr,
             split_large_figures=split_large_figures,
             deduplicate_figures=deduplicate_figures,
+            include_figure_overlays=include_figure_overlays,
             min_panel_split_width=min_panel_split_width,
             min_panel_split_height=min_panel_split_height,
             panel_split_trigger_reactions=panel_split_trigger_reactions,
@@ -842,7 +935,10 @@ async def extract_pdf(
         with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
             archive.writestr("metadata.json", json.dumps(payload["metadata"], indent=2, ensure_ascii=False))
             if "figures" in payload:
-                archive.writestr("figures/result.json", json.dumps(payload["figures"], indent=2, ensure_ascii=False))
+                overlay_files = payload["figures"].get("_overlay_files", [])
+                archive.writestr("figures/result.json", json.dumps(_without_internal_files(payload["figures"]), indent=2, ensure_ascii=False))
+                for overlay in overlay_files:
+                    archive.writestr(f"figures/overlays/{overlay['name']}", overlay["content"])
             if "text_reactions" in payload:
                 archive.writestr("text/reactions.json", json.dumps(payload["text_reactions"], indent=2, ensure_ascii=False))
             if "text_molecules" in payload:
@@ -853,4 +949,4 @@ async def extract_pdf(
             headers={"Content-Disposition": "attachment; filename=openchemie_pdf_results.zip"},
         )
 
-    return JSONResponse(payload)
+    return JSONResponse(_without_internal_files(payload))
