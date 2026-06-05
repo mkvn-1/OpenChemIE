@@ -1,0 +1,165 @@
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import time
+import zipfile
+from pathlib import Path
+from typing import Any
+
+import torch
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+import api.figure_pipeline_api as api
+from api.figure_pipeline_api import _download_layout_checkpoint, _extract_from_pdf, _without_internal_files
+from openchemie import OpenChemIE
+
+
+def _reaction_counts_by_page(results: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for item in results:
+        page = item.get("page")
+        if page is None:
+            page_label = "unknown"
+        else:
+            page_label = str(page + 1)
+        counts[page_label] = counts.get(page_label, 0) + len(item.get("reactions", []))
+    return counts
+
+
+def _write_zip(output_zip: Path, payload: dict[str, Any]) -> None:
+    overlay_files = payload.get("_overlay_files", [])
+    with zipfile.ZipFile(output_zip, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("figures/result.json", json.dumps(_without_internal_files(payload), indent=2, ensure_ascii=False))
+        for overlay in overlay_files:
+            archive.writestr(f"figures/overlays/{overlay['name']}", overlay["content"])
+
+
+def _write_report(output_dir: Path, pdf: Path, payload: dict[str, Any], started: float) -> Path:
+    metadata = payload["metadata"]
+    results = payload["results"]
+    report = {
+        "pdf": str(pdf.resolve()),
+        "elapsed_seconds": round(time.perf_counter() - started, 3),
+        "device": metadata.get("model", {}).get("device") or str(api._model.device if api._model else "unknown"),
+        "torch_version": torch.__version__,
+        "cuda_available": torch.cuda.is_available(),
+        "cuda_device_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
+        "figures_processed": metadata["figures_processed"],
+        "total_reactions": metadata["total_reactions"],
+        "reaction_counts_by_page": _reaction_counts_by_page(results),
+        "pages_with_figures_one_based": sorted({item["page"] + 1 for item in results if item.get("page") is not None}),
+        "split_large_figures": metadata.get("split_large_figures"),
+        "deduplicate_figures": metadata.get("deduplicate_figures"),
+        "panel_fallbacks_applied": metadata.get("panel_fallbacks_applied"),
+        "panel_fallbacks": metadata.get("panel_fallbacks"),
+        "dropped_zero_reaction_figures": metadata.get("dropped_zero_reaction_figures"),
+        "dropped_duplicate_figures": metadata.get("dropped_duplicate_figures"),
+        "deduplication_drops": metadata.get("deduplication_drops"),
+        "overlay_count": metadata.get("overlay_count"),
+        "overlay_directory": str(output_dir / "overlays"),
+        "caveat": "This is an extraction and visual-audit report. Exact all-reaction recall still requires manually labeled ground truth.",
+    }
+    report_path = output_dir / "reaction_audit_report.json"
+    report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    return report_path
+
+
+def _write_overlays(output_dir: Path, payload: dict[str, Any]) -> None:
+    overlay_dir = output_dir / "overlays"
+    overlay_dir.mkdir(parents=True, exist_ok=True)
+    summary = []
+    for overlay in payload.get("_overlay_files", []):
+        path = overlay_dir / overlay["name"]
+        path.write_bytes(overlay["content"])
+        summary.append(
+            {
+                "name": overlay["name"],
+                "path": str(path),
+                "page": overlay.get("page"),
+                "source_figure_index": overlay.get("source_figure_index"),
+                "source_panel": overlay.get("source_panel"),
+                "reaction_count": overlay.get("reaction_count"),
+            }
+        )
+    (overlay_dir / "overlay_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Run high-recall OpenChemIE figure extraction and write audit artifacts.")
+    parser.add_argument("pdf", type=Path)
+    parser.add_argument("--output-dir", type=Path, default=Path("reaction_audit_output"))
+    parser.add_argument("--output-zip", type=Path, default=None)
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--num-pages", type=int, default=None)
+    parser.add_argument("--molscribe", action="store_true")
+    parser.add_argument("--ocr", action="store_true")
+    parser.add_argument("--no-split-large-figures", action="store_true")
+    parser.add_argument("--no-deduplicate-figures", action="store_true")
+    parser.add_argument("--panel-split-trigger-reactions", type=int, default=0)
+    parser.add_argument("--min-panel-split-width", type=int, default=900)
+    parser.add_argument("--min-panel-split-height", type=int, default=900)
+    args = parser.parse_args()
+
+    if not args.pdf.exists():
+        raise FileNotFoundError(args.pdf)
+    if args.device.startswith("cuda") and not torch.cuda.is_available():
+        raise RuntimeError("CUDA was requested but torch.cuda.is_available() is False")
+
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    started = time.perf_counter()
+
+    api._model = OpenChemIE(device=args.device)
+    api._model_info = {
+        "status": "ready",
+        "device": str(api._model.device),
+        "torch_version": torch.__version__,
+        "cuda_available": torch.cuda.is_available(),
+        "cuda_device_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
+    }
+    api._model.init_pdfparser(ckpt_path=_download_layout_checkpoint())
+    api._model.init_rxnscribe()
+
+    payload = _extract_from_pdf(
+        str(args.pdf),
+        batch_size=args.batch_size,
+        num_pages=args.num_pages,
+        molscribe=args.molscribe,
+        ocr=args.ocr,
+        split_large_figures=not args.no_split_large_figures,
+        deduplicate_figures=not args.no_deduplicate_figures,
+        include_overlays=True,
+        min_panel_split_width=args.min_panel_split_width,
+        min_panel_split_height=args.min_panel_split_height,
+        panel_split_trigger_reactions=args.panel_split_trigger_reactions,
+    )
+
+    result_path = args.output_dir / "figures_result.json"
+    result_path.write_text(json.dumps(_without_internal_files(payload), indent=2, ensure_ascii=False), encoding="utf-8")
+    _write_overlays(args.output_dir, payload)
+    report_path = _write_report(args.output_dir, args.pdf, payload, started)
+
+    output_zip = args.output_zip or args.output_dir / "reaction_audit_results.zip"
+    _write_zip(output_zip, payload)
+
+    summary = {
+        "result_json": str(result_path),
+        "audit_report": str(report_path),
+        "output_zip": str(output_zip),
+        "figures_processed": payload["metadata"]["figures_processed"],
+        "total_reactions": payload["metadata"]["total_reactions"],
+        "panel_fallbacks_applied": payload["metadata"]["panel_fallbacks_applied"],
+        "dropped_zero_reaction_figures": payload["metadata"]["dropped_zero_reaction_figures"],
+        "dropped_duplicate_figures": payload["metadata"]["dropped_duplicate_figures"],
+        "overlay_count": payload["metadata"]["overlay_count"],
+    }
+    print(json.dumps(summary, indent=2))
+
+
+if __name__ == "__main__":
+    main()

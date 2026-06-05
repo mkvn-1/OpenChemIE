@@ -378,6 +378,36 @@ Remove container:
 docker rm -f openchemie-api-test
 ```
 
+## Offline Accuracy Audit Script
+
+Use this when you want extraction results plus overlay images and a compact
+audit report without starting the FastAPI server:
+
+```bash
+python scripts/audit_pdf_reactions.py example/acs.joc.2c00749.pdf --output-dir reaction_audit --output-zip reaction_audit.zip --device cuda
+```
+
+The script uses the same high-recall figure workflow:
+
+```text
+split_large_figures=true
+deduplicate_figures=true
+panel_split_trigger_reactions=0
+include overlays=true
+```
+
+It writes:
+
+```text
+reaction_audit/figures_result.json
+reaction_audit/reaction_audit_report.json
+reaction_audit/overlays/*.png
+reaction_audit.zip
+```
+
+The report includes page-level reaction counts, panel fallback details,
+deduplication drops, and CUDA device information.
+
 ## Tested Result In This Workspace
 
 The Docker API was tested with:
