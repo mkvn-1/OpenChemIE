@@ -119,7 +119,7 @@ def _write_overlay_contact_sheet(output_dir: Path) -> Path | None:
     return sheet_path
 
 
-def _write_report(output_dir: Path, pdf: Path, payload: dict[str, Any], started: float) -> Path:
+def _write_report(output_dir: Path, pdf: Path, payload: dict[str, Any], started: float) -> tuple[Path, dict[str, Any]]:
     metadata = payload["metadata"]
     results = payload["results"]
     figure_caption_pages = _extract_figure_caption_pages(pdf)
@@ -160,7 +160,7 @@ def _write_report(output_dir: Path, pdf: Path, payload: dict[str, Any], started:
     }
     report_path = output_dir / "reaction_audit_report.json"
     report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
-    return report_path
+    return report_path, report
 
 
 def _write_overlays(output_dir: Path, payload: dict[str, Any]) -> None:
@@ -198,6 +198,9 @@ def main() -> None:
     parser.add_argument("--panel-split-trigger-reactions", type=int, default=0)
     parser.add_argument("--min-panel-split-width", type=int, default=900)
     parser.add_argument("--min-panel-split-height", type=int, default=900)
+    parser.add_argument("--fail-on-caption-miss", action="store_true", help="Exit nonzero if any detected caption page has no extraction result.")
+    parser.add_argument("--min-total-reactions", type=int, default=None, help="Exit nonzero if total extracted reactions is below this threshold.")
+    parser.add_argument("--require-panel-fallback", action="store_true", help="Exit nonzero if no large-figure panel fallback was applied.")
     args = parser.parse_args()
 
     if not args.pdf.exists():
@@ -237,7 +240,7 @@ def main() -> None:
     result_path.write_text(json.dumps(_without_internal_files(payload), indent=2, ensure_ascii=False), encoding="utf-8")
     _write_overlays(args.output_dir, payload)
     contact_sheet_path = _write_overlay_contact_sheet(args.output_dir)
-    report_path = _write_report(args.output_dir, args.pdf, payload, started)
+    report_path, report = _write_report(args.output_dir, args.pdf, payload, started)
 
     output_zip = args.output_zip or args.output_dir / "reaction_audit_results.zip"
     _write_zip(output_zip, payload)
@@ -255,6 +258,21 @@ def main() -> None:
         "overlay_contact_sheet": str(contact_sheet_path) if contact_sheet_path else None,
     }
     print(json.dumps(summary, indent=2))
+
+    failures = []
+    if args.fail_on_caption_miss and report["caption_pages_without_extractions"]:
+        failures.append(
+            "caption pages without extraction: "
+            + ", ".join(report["caption_pages_without_extractions"])
+        )
+    if args.min_total_reactions is not None and report["total_reactions"] < args.min_total_reactions:
+        failures.append(
+            f"total reactions {report['total_reactions']} below required minimum {args.min_total_reactions}"
+        )
+    if args.require_panel_fallback and report["panel_fallbacks_applied"] < 1:
+        failures.append("required panel fallback was not applied")
+    if failures:
+        raise SystemExit("Audit failed: " + "; ".join(failures))
 
 
 if __name__ == "__main__":

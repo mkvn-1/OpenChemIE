@@ -387,6 +387,16 @@ audit report without starting the FastAPI server:
 python scripts/audit_pdf_reactions.py example/acs.joc.2c00749.pdf --output-dir reaction_audit --output-zip reaction_audit.zip --device cuda
 ```
 
+For the validated ACS sample PDF, you can run a stricter gate:
+
+```bash
+python scripts/audit_pdf_reactions.py example/acs.joc.2c00749.pdf --output-dir reaction_audit --device cuda --fail-on-caption-miss --min-total-reactions 105 --require-panel-fallback
+```
+
+This exits nonzero if captioned figure pages are missing, if fewer than 105
+reaction candidates are extracted, or if the large-figure panel fallback does
+not run.
+
 The script uses the same high-recall figure workflow:
 
 ```text
