@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
+import shutil
+import subprocess
 import sys
 import time
 import zipfile
@@ -9,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+from PIL import Image, ImageDraw
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -39,9 +43,96 @@ def _write_zip(output_zip: Path, payload: dict[str, Any]) -> None:
             archive.writestr(f"figures/overlays/{overlay['name']}", overlay["content"])
 
 
+def _extract_figure_caption_pages(pdf: Path) -> dict[str, list[str]]:
+    pdftotext = shutil.which("pdftotext")
+    if sys.platform.startswith("win"):
+        try:
+            candidates = subprocess.run(
+                ["where.exe", "pdftotext"],
+                check=True,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            ).stdout.splitlines()
+            pdftotext = next((item for item in candidates if Path(item).suffix.lower() == ".exe"), pdftotext)
+        except (OSError, subprocess.CalledProcessError):
+            pass
+    pages: list[str] = []
+    if pdftotext and Path(pdftotext).suffix.lower() in {"", ".exe"}:
+        try:
+            completed = subprocess.run(
+                [pdftotext, "-layout", str(pdf), "-"],
+                check=True,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            pages = completed.stdout.split("\f")
+        except (OSError, subprocess.CalledProcessError):
+            pages = []
+    if not pages:
+        try:
+            from PyPDF2 import PdfReader
+
+            reader = PdfReader(str(pdf))
+            pages = [page.extract_text() or "" for page in reader.pages]
+        except Exception:
+            return {}
+    figure_pages: dict[str, list[str]] = {}
+    figure_pattern = re.compile(r"(?:^|\s{2,})Figure\s+(\d+)\.")
+    for page_index, page_text in enumerate(pages, start=1):
+        captions = []
+        for line in page_text.splitlines():
+            if "Figure " not in line:
+                continue
+            matches = figure_pattern.findall(line)
+            if matches:
+                captions.extend(f"Figure {match}" for match in matches)
+        if captions:
+            figure_pages[str(page_index)] = sorted(set(captions), key=lambda item: int(item.split()[1]))
+    return figure_pages
+
+
+def _write_overlay_contact_sheet(output_dir: Path) -> Path | None:
+    overlay_dir = output_dir / "overlays"
+    overlay_paths = sorted(path for path in overlay_dir.glob("*.png") if path.name.startswith("overlay_"))
+    if not overlay_paths:
+        return None
+    thumbs = []
+    for path in overlay_paths:
+        image = Image.open(path).convert("RGB")
+        image.thumbnail((360, 360))
+        canvas = Image.new("RGB", (390, 410), "white")
+        canvas.paste(image, ((390 - image.width) // 2, 35))
+        draw = ImageDraw.Draw(canvas)
+        draw.text((8, 8), path.stem, fill="black")
+        thumbs.append(canvas)
+    columns = 2
+    rows = (len(thumbs) + columns - 1) // columns
+    sheet = Image.new("RGB", (columns * 390, rows * 410), "white")
+    for index, thumb in enumerate(thumbs):
+        sheet.paste(thumb, ((index % columns) * 390, (index // columns) * 410))
+    sheet_path = output_dir / "overlay_contact_sheet.png"
+    sheet.save(sheet_path)
+    return sheet_path
+
+
 def _write_report(output_dir: Path, pdf: Path, payload: dict[str, Any], started: float) -> Path:
     metadata = payload["metadata"]
     results = payload["results"]
+    figure_caption_pages = _extract_figure_caption_pages(pdf)
+    extracted_pages = {str(item["page"] + 1) for item in results if item.get("page") is not None}
+    expected_numbered_pages = {
+        page
+        for page, captions in figure_caption_pages.items()
+        if any(caption.startswith("Figure ") for caption in captions)
+    }
+    # The text extractor also sees prose references. Keep this as a coverage
+    # warning, not a hard assertion of figure-page ground truth.
+    missing_caption_pages = sorted(expected_numbered_pages - extracted_pages, key=int)
+    overlay_contact_sheet = output_dir / "overlay_contact_sheet.png"
     report = {
         "pdf": str(pdf.resolve()),
         "elapsed_seconds": round(time.perf_counter() - started, 3),
@@ -53,6 +144,8 @@ def _write_report(output_dir: Path, pdf: Path, payload: dict[str, Any], started:
         "total_reactions": metadata["total_reactions"],
         "reaction_counts_by_page": _reaction_counts_by_page(results),
         "pages_with_figures_one_based": sorted({item["page"] + 1 for item in results if item.get("page") is not None}),
+        "figure_caption_pages_from_text": figure_caption_pages,
+        "caption_pages_without_extractions": missing_caption_pages,
         "split_large_figures": metadata.get("split_large_figures"),
         "deduplicate_figures": metadata.get("deduplicate_figures"),
         "panel_fallbacks_applied": metadata.get("panel_fallbacks_applied"),
@@ -62,6 +155,7 @@ def _write_report(output_dir: Path, pdf: Path, payload: dict[str, Any], started:
         "deduplication_drops": metadata.get("deduplication_drops"),
         "overlay_count": metadata.get("overlay_count"),
         "overlay_directory": str(output_dir / "overlays"),
+        "overlay_contact_sheet": str(overlay_contact_sheet) if overlay_contact_sheet.exists() else None,
         "caveat": "This is an extraction and visual-audit report. Exact all-reaction recall still requires manually labeled ground truth.",
     }
     report_path = output_dir / "reaction_audit_report.json"
@@ -142,6 +236,7 @@ def main() -> None:
     result_path = args.output_dir / "figures_result.json"
     result_path.write_text(json.dumps(_without_internal_files(payload), indent=2, ensure_ascii=False), encoding="utf-8")
     _write_overlays(args.output_dir, payload)
+    contact_sheet_path = _write_overlay_contact_sheet(args.output_dir)
     report_path = _write_report(args.output_dir, args.pdf, payload, started)
 
     output_zip = args.output_zip or args.output_dir / "reaction_audit_results.zip"
@@ -157,6 +252,7 @@ def main() -> None:
         "dropped_zero_reaction_figures": payload["metadata"]["dropped_zero_reaction_figures"],
         "dropped_duplicate_figures": payload["metadata"]["dropped_duplicate_figures"],
         "overlay_count": payload["metadata"]["overlay_count"],
+        "overlay_contact_sheet": str(contact_sheet_path) if contact_sheet_path else None,
     }
     print(json.dumps(summary, indent=2))
 
