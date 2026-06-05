@@ -258,6 +258,7 @@ batch_size=1
 num_pages=1
 molscribe=false
 ocr=false
+split_large_figures=true
 ```
 
 Use `molscribe=true` and `ocr=true` only when you need richer output.
@@ -290,6 +291,8 @@ include_text_reactions=true|false
 include_text_molecules=true|false
 molscribe=true|false
 ocr=true|false
+split_large_figures=true|false
+panel_split_trigger_reactions=0
 ```
 
 For faster testing, set:
@@ -300,6 +303,17 @@ molscribe=false
 ocr=false
 include_text_reactions=false
 ```
+
+For better recall on large multi-panel figures, keep this enabled:
+
+```text
+split_large_figures=true
+panel_split_trigger_reactions=0
+```
+
+This fallback reruns only large figures that return zero reactions on the first
+pass. It selects one non-overlapping split strategy and reports the selected
+panels in `metadata.panel_fallbacks`.
 
 For richer extraction on H100, try:
 
@@ -384,4 +398,3 @@ figures_processed: 1
 figure reactions: 6
 text molecule labels: 1
 ```
-

@@ -237,6 +237,160 @@ def _summarize(results: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _split_large_figure(image: Any) -> list[dict[str, Any]]:
+    width, height = image.size
+    midpoint_x = width // 2
+    midpoint_y = height // 2
+    strategies = [
+        (
+            "vertical_halves",
+            [
+                ("left", (0, 0, midpoint_x, height)),
+                ("right", (midpoint_x, 0, width, height)),
+            ],
+        ),
+        (
+            "horizontal_halves",
+            [
+                ("top", (0, 0, width, midpoint_y)),
+                ("bottom", (0, midpoint_y, width, height)),
+            ],
+        ),
+        (
+            "quadrants",
+            [
+                ("top_left", (0, 0, midpoint_x, midpoint_y)),
+                ("top_right", (midpoint_x, 0, width, midpoint_y)),
+                ("bottom_left", (0, midpoint_y, midpoint_x, height)),
+                ("bottom_right", (midpoint_x, midpoint_y, width, height)),
+            ],
+        ),
+    ]
+    candidates = []
+    for strategy, boxes in strategies:
+        panels = []
+        for name, box in boxes:
+            x1, y1, x2, y2 = box
+            if x2 - x1 < 180 or y2 - y1 < 180:
+                continue
+            panels.append(
+                {
+                    "strategy": strategy,
+                    "panel": name,
+                    "bbox_in_figure": box,
+                    "image": image.crop(box),
+                }
+            )
+        if panels:
+            candidates.append({"strategy": strategy, "panels": panels})
+    return candidates
+
+
+def _extract_from_pdf_with_panel_fallback(
+    model: OpenChemIE,
+    pdf_path: str,
+    *,
+    batch_size: int,
+    num_pages: int | None,
+    molscribe: bool,
+    ocr: bool,
+    split_large_figures: bool,
+    min_panel_split_width: int,
+    min_panel_split_height: int,
+    panel_split_trigger_reactions: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    figures = model.extract_figures_from_pdf(pdf_path, num_pages=num_pages, output_bbox=True)
+    images = [figure["figure"]["image"] for figure in figures]
+    base_results = model.extract_reactions_from_figures(
+        images,
+        batch_size=batch_size,
+        molscribe=molscribe,
+        ocr=ocr,
+    )
+
+    fallback_records: list[dict[str, Any]] = []
+    final_results: list[dict[str, Any]] = []
+    for index, (figure, result) in enumerate(zip(figures, base_results), start=1):
+        result["page"] = figure["page"]
+        image = figure["figure"]["image"]
+        width, height = image.size
+        reaction_count = len(result.get("reactions", []))
+        should_split = (
+            split_large_figures
+            and width >= min_panel_split_width
+            and height >= min_panel_split_height
+            and reaction_count <= panel_split_trigger_reactions
+        )
+        if not should_split:
+            final_results.append(result)
+            continue
+
+        best_strategy: dict[str, Any] | None = None
+        for candidate in _split_large_figure(image):
+            panels = candidate["panels"]
+            panel_results = model.extract_reactions_from_figures(
+                [panel["image"] for panel in panels],
+                batch_size=batch_size,
+                molscribe=molscribe,
+                ocr=ocr,
+            )
+            accepted_panels: list[dict[str, Any]] = []
+            for panel, panel_result in zip(panels, panel_results):
+                panel_reaction_count = len(panel_result.get("reactions", []))
+                if panel_reaction_count <= 0:
+                    continue
+                panel_result["page"] = figure["page"]
+                panel_result["source_figure_index"] = index
+                panel_result["source_split_strategy"] = candidate["strategy"]
+                panel_result["source_panel"] = panel["panel"]
+                panel_result["panel_bbox_in_source_figure"] = panel["bbox_in_figure"]
+                accepted_panels.append(panel_result)
+            candidate_total = sum(len(panel.get("reactions", [])) for panel in accepted_panels)
+            if best_strategy is None or candidate_total > best_strategy["total_reactions"]:
+                best_strategy = {
+                    "strategy": candidate["strategy"],
+                    "total_reactions": candidate_total,
+                    "accepted_panels": accepted_panels,
+                }
+
+        accepted_panels = []
+        if best_strategy and best_strategy["total_reactions"] > reaction_count:
+            accepted_panels = best_strategy["accepted_panels"]
+
+        if accepted_panels:
+            final_results.extend(accepted_panels)
+            fallback_records.append(
+                {
+                    "source_figure_index": index,
+                    "page": figure["page"],
+                    "source_size": [width, height],
+                    "source_reactions": reaction_count,
+                    "selected_strategy": best_strategy["strategy"] if best_strategy else None,
+                    "accepted_panels": [
+                        {
+                            "panel": panel["source_panel"],
+                            "strategy": panel["source_split_strategy"],
+                            "reaction_count": len(panel.get("reactions", [])),
+                            "bbox_in_source_figure": panel["panel_bbox_in_source_figure"],
+                        }
+                        for panel in accepted_panels
+                    ],
+                }
+            )
+        else:
+            final_results.append(result)
+
+    metadata = {
+        "split_large_figures": split_large_figures,
+        "min_panel_split_width": min_panel_split_width,
+        "min_panel_split_height": min_panel_split_height,
+        "panel_split_trigger_reactions": panel_split_trigger_reactions,
+        "panel_fallbacks_applied": len(fallback_records),
+        "panel_fallbacks": fallback_records,
+    }
+    return final_results, metadata
+
+
 def _extract_from_pdf(
     pdf_path: str,
     *,
@@ -244,15 +398,24 @@ def _extract_from_pdf(
     num_pages: int | None,
     molscribe: bool,
     ocr: bool,
+    split_large_figures: bool,
+    min_panel_split_width: int,
+    min_panel_split_height: int,
+    panel_split_trigger_reactions: int,
 ) -> dict[str, Any]:
     model = _require_model()
     started = time.perf_counter()
-    results = model.extract_reactions_from_figures_in_pdf(
+    results, fallback_metadata = _extract_from_pdf_with_panel_fallback(
+        model,
         pdf_path,
         batch_size=batch_size,
         num_pages=num_pages,
         molscribe=molscribe,
         ocr=ocr,
+        split_large_figures=split_large_figures,
+        min_panel_split_width=min_panel_split_width,
+        min_panel_split_height=min_panel_split_height,
+        panel_split_trigger_reactions=panel_split_trigger_reactions,
     )
     clean_results = _jsonable(results)
     return {
@@ -264,6 +427,7 @@ def _extract_from_pdf(
             "ocr": ocr,
             "elapsed_seconds": round(time.perf_counter() - started, 3),
             "model": _model_info,
+            **fallback_metadata,
             **_summarize(clean_results),
         },
         "results": clean_results,
@@ -331,6 +495,10 @@ def _extract_combined_pdf(
     include_text_molecules: bool,
     molscribe: bool,
     ocr: bool,
+    split_large_figures: bool,
+    min_panel_split_width: int,
+    min_panel_split_height: int,
+    panel_split_trigger_reactions: int,
 ) -> dict[str, Any]:
     started = time.perf_counter()
     payload: dict[str, Any] = {
@@ -351,6 +519,10 @@ def _extract_combined_pdf(
             num_pages=num_pages,
             molscribe=molscribe,
             ocr=ocr,
+            split_large_figures=split_large_figures,
+            min_panel_split_width=min_panel_split_width,
+            min_panel_split_height=min_panel_split_height,
+            panel_split_trigger_reactions=panel_split_trigger_reactions,
         )
     if include_text_reactions:
         payload["text_reactions"] = _extract_text_reactions(pdf_path, num_pages=num_pages)
@@ -422,6 +594,10 @@ async def extract_figures(
     num_pages: int | None = Query(None, ge=1, description="Limit to the first N pages."),
     molscribe: bool = Query(False, description="Return SMILES/molfile for molecule images. Slower and uses more VRAM."),
     ocr: bool = Query(False, description="OCR reaction condition text. Slower and uses more VRAM."),
+    split_large_figures: bool = Query(True, description="Rerun large low-recall figures as smaller panels."),
+    min_panel_split_width: int = Query(900, ge=1),
+    min_panel_split_height: int = Query(900, ge=1),
+    panel_split_trigger_reactions: int = Query(0, ge=0, description="Split only when a large figure has this many reactions or fewer."),
 ) -> Response:
     if not pdf.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Upload must be a PDF file.")
@@ -439,6 +615,10 @@ async def extract_figures(
             num_pages=num_pages,
             molscribe=molscribe,
             ocr=ocr,
+            split_large_figures=split_large_figures,
+            min_panel_split_width=min_panel_split_width,
+            min_panel_split_height=min_panel_split_height,
+            panel_split_trigger_reactions=panel_split_trigger_reactions,
         )
     finally:
         temp_path.unlink(missing_ok=True)
@@ -468,6 +648,10 @@ async def extract_pdf(
     include_text_molecules: bool = Query(True),
     molscribe: bool = Query(False, description="Return SMILES/molfile for figure molecules. Slower and uses more VRAM."),
     ocr: bool = Query(False, description="OCR figure reaction condition text. Slower and uses more VRAM."),
+    split_large_figures: bool = Query(True, description="Rerun large low-recall figures as smaller panels."),
+    min_panel_split_width: int = Query(900, ge=1),
+    min_panel_split_height: int = Query(900, ge=1),
+    panel_split_trigger_reactions: int = Query(0, ge=0, description="Split only when a large figure has this many reactions or fewer."),
 ) -> Response:
     if not pdf.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Upload must be a PDF file.")
@@ -491,6 +675,10 @@ async def extract_pdf(
             include_text_molecules=include_text_molecules,
             molscribe=molscribe,
             ocr=ocr,
+            split_large_figures=split_large_figures,
+            min_panel_split_width=min_panel_split_width,
+            min_panel_split_height=min_panel_split_height,
+            panel_split_trigger_reactions=panel_split_trigger_reactions,
         )
     finally:
         temp_path.unlink(missing_ok=True)

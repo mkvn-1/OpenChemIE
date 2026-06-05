@@ -89,6 +89,18 @@ curl -X POST "http://localhost:8000/extract-pdf?include_text_molecules=false&mol
   -o openchemie_results.zip
 ```
 
+Large multi-panel figures can be split and retried automatically when the
+first pass finds too few reactions:
+
+```bash
+curl -X POST "http://localhost:8000/extract-pdf?response_format=zip&split_large_figures=true&panel_split_trigger_reactions=0" \
+  -F "pdf=@example/acs.joc.2c00749.pdf" \
+  -o openchemie_results.zip
+```
+
+The fallback is enabled by default. It is useful for large figures where one
+detected crop contains several panels and RxnScribe misses the full crop.
+
 Fuller but slower output:
 
 ```bash
