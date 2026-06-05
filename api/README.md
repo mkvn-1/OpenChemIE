@@ -93,13 +93,15 @@ Large multi-panel figures can be split and retried automatically when the
 first pass finds too few reactions:
 
 ```bash
-curl -X POST "http://localhost:8000/extract-pdf?response_format=zip&split_large_figures=true&panel_split_trigger_reactions=0" \
+curl -X POST "http://localhost:8000/extract-pdf?response_format=zip&split_large_figures=true&deduplicate_figures=true&panel_split_trigger_reactions=0" \
   -F "pdf=@example/acs.joc.2c00749.pdf" \
   -o openchemie_results.zip
 ```
 
 The fallback is enabled by default. It is useful for large figures where one
 detected crop contains several panels and RxnScribe misses the full crop.
+De-duplication is also enabled by default to drop zero-reaction false positives
+and nested layout crops that duplicate a larger detected figure.
 
 Fuller but slower output:
 

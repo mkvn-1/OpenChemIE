@@ -237,6 +237,126 @@ def _summarize(results: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _bbox_to_list(value: Any) -> list[float] | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        value = value.strip("[]()")
+        parts = [part.strip() for part in value.split(",") if part.strip()]
+        if len(parts) != 4:
+            return None
+        return [float(part) for part in parts]
+    if isinstance(value, (list, tuple)) and len(value) == 4:
+        return [float(part) for part in value]
+    return None
+
+
+def _bbox_area(box: list[float]) -> float:
+    return max(0.0, box[2] - box[0]) * max(0.0, box[3] - box[1])
+
+
+def _bbox_intersection(a: list[float], b: list[float]) -> float:
+    x1 = max(a[0], b[0])
+    y1 = max(a[1], b[1])
+    x2 = min(a[2], b[2])
+    y2 = min(a[3], b[3])
+    return max(0.0, x2 - x1) * max(0.0, y2 - y1)
+
+
+def _bbox_iou(a: list[float], b: list[float]) -> float:
+    intersection = _bbox_intersection(a, b)
+    union = _bbox_area(a) + _bbox_area(b) - intersection
+    return intersection / union if union else 0.0
+
+
+def _bbox_containment(inner: list[float], outer: list[float]) -> float:
+    inner_area = _bbox_area(inner)
+    return _bbox_intersection(inner, outer) / inner_area if inner_area else 0.0
+
+
+def _panel_bbox_on_page(source_bbox: list[float] | None, source_size: tuple[int, int], panel_bbox: tuple[int, int, int, int]) -> list[float] | None:
+    if source_bbox is None:
+        return None
+    source_width, source_height = source_size
+    if source_width <= 0 or source_height <= 0:
+        return None
+    page_width = source_bbox[2] - source_bbox[0]
+    page_height = source_bbox[3] - source_bbox[1]
+    x1, y1, x2, y2 = panel_bbox
+    return [
+        source_bbox[0] + page_width * (x1 / source_width),
+        source_bbox[1] + page_height * (y1 / source_height),
+        source_bbox[0] + page_width * (x2 / source_width),
+        source_bbox[1] + page_height * (y2 / source_height),
+    ]
+
+
+def _deduplicate_figure_results(results: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    candidates = [result for result in results if len(result.get("reactions", [])) > 0]
+    dropped: list[dict[str, Any]] = []
+
+    grouped: dict[Any, list[dict[str, Any]]] = {}
+    for result in candidates:
+        grouped.setdefault(result.get("page"), []).append(result)
+
+    kept: list[dict[str, Any]] = []
+    for page, page_results in grouped.items():
+        ordered = sorted(
+            page_results,
+            key=lambda item: (
+                len(item.get("reactions", [])),
+                _bbox_area(item.get("source_figure_bbox") or [0, 0, 0, 0]),
+            ),
+            reverse=True,
+        )
+        page_kept: list[dict[str, Any]] = []
+        for result in ordered:
+            bbox = result.get("source_figure_bbox")
+            should_drop = False
+            for existing in page_kept:
+                existing_bbox = existing.get("source_figure_bbox")
+                if not bbox or not existing_bbox:
+                    continue
+                iou = _bbox_iou(bbox, existing_bbox)
+                contained = _bbox_containment(bbox, existing_bbox)
+                existing_reactions = len(existing.get("reactions", []))
+                result_reactions = len(result.get("reactions", []))
+                if iou >= 0.80 or (contained >= 0.88 and existing_reactions >= result_reactions):
+                    should_drop = True
+                    dropped.append(
+                        {
+                            "page": page,
+                            "source_figure_index": result.get("source_figure_index"),
+                            "reaction_count": result_reactions,
+                            "reason": "overlapping_or_contained_duplicate",
+                            "overlap_with_source_figure_index": existing.get("source_figure_index"),
+                            "iou": round(iou, 4),
+                            "containment": round(contained, 4),
+                        }
+                    )
+                    break
+            if not should_drop:
+                page_kept.append(result)
+        kept.extend(sorted(page_kept, key=lambda item: item.get("source_figure_index", 0)))
+
+    zero_reaction_drops = [
+        {
+            "page": result.get("page"),
+            "source_figure_index": result.get("source_figure_index"),
+            "reason": "zero_reactions",
+        }
+        for result in results
+        if len(result.get("reactions", [])) == 0
+    ]
+    metadata = {
+        "deduplicate_figures": True,
+        "dropped_zero_reaction_figures": len(zero_reaction_drops),
+        "dropped_duplicate_figures": len(dropped),
+        "deduplication_drops": zero_reaction_drops + dropped,
+    }
+    return kept, metadata
+
+
 def _split_large_figure(image: Any) -> list[dict[str, Any]]:
     width, height = image.size
     midpoint_x = width // 2
@@ -295,6 +415,7 @@ def _extract_from_pdf_with_panel_fallback(
     molscribe: bool,
     ocr: bool,
     split_large_figures: bool,
+    deduplicate_figures: bool,
     min_panel_split_width: int,
     min_panel_split_height: int,
     panel_split_trigger_reactions: int,
@@ -312,8 +433,12 @@ def _extract_from_pdf_with_panel_fallback(
     final_results: list[dict[str, Any]] = []
     for index, (figure, result) in enumerate(zip(figures, base_results), start=1):
         result["page"] = figure["page"]
+        source_bbox = _bbox_to_list(figure["figure"].get("bbox"))
+        result["source_figure_index"] = index
+        result["source_figure_bbox"] = source_bbox
         image = figure["figure"]["image"]
         width, height = image.size
+        result["source_figure_size"] = [width, height]
         reaction_count = len(result.get("reactions", []))
         should_split = (
             split_large_figures
@@ -344,6 +469,15 @@ def _extract_from_pdf_with_panel_fallback(
                 panel_result["source_split_strategy"] = candidate["strategy"]
                 panel_result["source_panel"] = panel["panel"]
                 panel_result["panel_bbox_in_source_figure"] = panel["bbox_in_figure"]
+                panel_result["source_figure_bbox"] = _panel_bbox_on_page(
+                    source_bbox,
+                    (width, height),
+                    panel["bbox_in_figure"],
+                )
+                panel_result["source_figure_size"] = [
+                    panel["bbox_in_figure"][2] - panel["bbox_in_figure"][0],
+                    panel["bbox_in_figure"][3] - panel["bbox_in_figure"][1],
+                ]
                 accepted_panels.append(panel_result)
             candidate_total = sum(len(panel.get("reactions", [])) for panel in accepted_panels)
             if best_strategy is None or candidate_total > best_strategy["total_reactions"]:
@@ -380,13 +514,25 @@ def _extract_from_pdf_with_panel_fallback(
         else:
             final_results.append(result)
 
+    if deduplicate_figures:
+        final_results, deduplication_metadata = _deduplicate_figure_results(final_results)
+    else:
+        deduplication_metadata = {
+            "deduplicate_figures": False,
+            "dropped_zero_reaction_figures": 0,
+            "dropped_duplicate_figures": 0,
+            "deduplication_drops": [],
+        }
+
     metadata = {
         "split_large_figures": split_large_figures,
+        "deduplicate_figures": deduplicate_figures,
         "min_panel_split_width": min_panel_split_width,
         "min_panel_split_height": min_panel_split_height,
         "panel_split_trigger_reactions": panel_split_trigger_reactions,
         "panel_fallbacks_applied": len(fallback_records),
         "panel_fallbacks": fallback_records,
+        **deduplication_metadata,
     }
     return final_results, metadata
 
@@ -399,6 +545,7 @@ def _extract_from_pdf(
     molscribe: bool,
     ocr: bool,
     split_large_figures: bool,
+    deduplicate_figures: bool,
     min_panel_split_width: int,
     min_panel_split_height: int,
     panel_split_trigger_reactions: int,
@@ -413,6 +560,7 @@ def _extract_from_pdf(
         molscribe=molscribe,
         ocr=ocr,
         split_large_figures=split_large_figures,
+        deduplicate_figures=deduplicate_figures,
         min_panel_split_width=min_panel_split_width,
         min_panel_split_height=min_panel_split_height,
         panel_split_trigger_reactions=panel_split_trigger_reactions,
@@ -496,6 +644,7 @@ def _extract_combined_pdf(
     molscribe: bool,
     ocr: bool,
     split_large_figures: bool,
+    deduplicate_figures: bool,
     min_panel_split_width: int,
     min_panel_split_height: int,
     panel_split_trigger_reactions: int,
@@ -520,6 +669,7 @@ def _extract_combined_pdf(
             molscribe=molscribe,
             ocr=ocr,
             split_large_figures=split_large_figures,
+            deduplicate_figures=deduplicate_figures,
             min_panel_split_width=min_panel_split_width,
             min_panel_split_height=min_panel_split_height,
             panel_split_trigger_reactions=panel_split_trigger_reactions,
@@ -595,6 +745,7 @@ async def extract_figures(
     molscribe: bool = Query(False, description="Return SMILES/molfile for molecule images. Slower and uses more VRAM."),
     ocr: bool = Query(False, description="OCR reaction condition text. Slower and uses more VRAM."),
     split_large_figures: bool = Query(True, description="Rerun large low-recall figures as smaller panels."),
+    deduplicate_figures: bool = Query(True, description="Drop zero-reaction and overlapping duplicate figure crops."),
     min_panel_split_width: int = Query(900, ge=1),
     min_panel_split_height: int = Query(900, ge=1),
     panel_split_trigger_reactions: int = Query(0, ge=0, description="Split only when a large figure has this many reactions or fewer."),
@@ -616,6 +767,7 @@ async def extract_figures(
             molscribe=molscribe,
             ocr=ocr,
             split_large_figures=split_large_figures,
+            deduplicate_figures=deduplicate_figures,
             min_panel_split_width=min_panel_split_width,
             min_panel_split_height=min_panel_split_height,
             panel_split_trigger_reactions=panel_split_trigger_reactions,
@@ -649,6 +801,7 @@ async def extract_pdf(
     molscribe: bool = Query(False, description="Return SMILES/molfile for figure molecules. Slower and uses more VRAM."),
     ocr: bool = Query(False, description="OCR figure reaction condition text. Slower and uses more VRAM."),
     split_large_figures: bool = Query(True, description="Rerun large low-recall figures as smaller panels."),
+    deduplicate_figures: bool = Query(True, description="Drop zero-reaction and overlapping duplicate figure crops."),
     min_panel_split_width: int = Query(900, ge=1),
     min_panel_split_height: int = Query(900, ge=1),
     panel_split_trigger_reactions: int = Query(0, ge=0, description="Split only when a large figure has this many reactions or fewer."),
@@ -676,6 +829,7 @@ async def extract_pdf(
             molscribe=molscribe,
             ocr=ocr,
             split_large_figures=split_large_figures,
+            deduplicate_figures=deduplicate_figures,
             min_panel_split_width=min_panel_split_width,
             min_panel_split_height=min_panel_split_height,
             panel_split_trigger_reactions=panel_split_trigger_reactions,

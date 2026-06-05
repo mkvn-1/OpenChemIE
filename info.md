@@ -259,6 +259,7 @@ num_pages=1
 molscribe=false
 ocr=false
 split_large_figures=true
+deduplicate_figures=true
 ```
 
 Use `molscribe=true` and `ocr=true` only when you need richer output.
@@ -292,6 +293,7 @@ include_text_molecules=true|false
 molscribe=true|false
 ocr=true|false
 split_large_figures=true|false
+deduplicate_figures=true|false
 panel_split_trigger_reactions=0
 ```
 
@@ -308,12 +310,15 @@ For better recall on large multi-panel figures, keep this enabled:
 
 ```text
 split_large_figures=true
+deduplicate_figures=true
 panel_split_trigger_reactions=0
 ```
 
 This fallback reruns only large figures that return zero reactions on the first
 pass. It selects one non-overlapping split strategy and reports the selected
 panels in `metadata.panel_fallbacks`.
+De-duplication drops zero-reaction false positives and nested layout crops that
+duplicate a larger detected figure.
 
 For richer extraction on H100, try:
 
