@@ -1,0 +1,13 @@
+.git
+.venv
+.venv310
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache
+.mypy_cache
+.cache
+OpenChemIE.egg-info
+example/gpu_test_output
+*.log

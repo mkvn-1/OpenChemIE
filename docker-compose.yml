@@ -1,0 +1,23 @@
+services:
+  openchemie-api:
+    build: .
+    image: openchemie-api:latest
+    ports:
+      - "8000:8000"
+    volumes:
+      - openchemie-hf-cache:/app/.cache/huggingface
+      - openchemie-torch-cache:/app/.cache/torch
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  openchemie-hf-cache:
+  openchemie-torch-cache:
